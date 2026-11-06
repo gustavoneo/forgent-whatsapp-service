@@ -1,3 +1,8 @@
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason
+} = require("@whiskeysockets/baileys");
 const express = require("express");
 const {
   default: makeWASocket,
