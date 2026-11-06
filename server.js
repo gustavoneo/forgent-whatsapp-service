@@ -2,10 +2,9 @@ const express = require("express");
 const {
   default: makeWASocket,
   useMultiFileAuthState,
-  DisconnectReason,
-  prepareWAMessageMedia,
-  generateWAMessageFromContent
+  DisconnectReason
 } = require("baileys");
+const { sendButtons } = require("gifted-btns");
 const pino = require("pino");
 const QRCode = require("qrcode");
 const path = require("path");
@@ -119,56 +118,22 @@ app.post("/send", async (req, res) => {
         buttonParamsJson: JSON.stringify({
           display_text: buttonText,
           url: buttonUrl,
-          merchant_url: buttonUrl,
         }),
       });
     }
 
-    let header = undefined;
-    if (imageUrl) {
-      try {
-        const media = await prepareWAMessageMedia(
-          { image: { url: imageUrl } },
-          { upload: sock.waUploadToServer }
-        );
-        header = {
-          title: "",
-          subtitle: "",
-          hasMediaAttachment: true,
-          imageMessage: media.imageMessage,
-        };
-      } catch (mediaErr) {
-        console.error("Erro ao preparar imagem, enviando sem mídia:", mediaErr);
-      }
-    }
-
-    const interactiveMessage = {
-      body: { text: text },
-      footer: { text: "Forgent PRO" },
-      header: header,
-      nativeFlowMessage: {
-        buttons: buttons,
-      },
+    const payload = {
+      text: text,
+      footer: "Forgent PRO",
+      buttons: buttons,
     };
 
-    const msg = generateWAMessageFromContent(
-      jid,
-      {
-        viewOnceMessage: {
-          message: {
-            messageContextInfo: {
-              deviceListMetadata: {},
-              deviceListMetadataVersion: 2,
-            },
-            interactiveMessage: interactiveMessage,
-          },
-        },
-      },
-      {}
-    );
+    if (imageUrl) {
+      payload.image = { url: imageUrl };
+    }
 
-    await sock.relayMessage(jid, msg.message, { messageId: msg.key.id });
-    res.json({ success: true, messageId: msg.key.id });
+    const result = await sendButtons(sock, jid, payload);
+    res.json({ success: true, result });
   } catch (err) {
     console.error("Erro ao enviar:", err);
     res.status(500).json({ error: err.message });
