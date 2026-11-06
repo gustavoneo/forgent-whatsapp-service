@@ -6,6 +6,7 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.18",
     "baileys": "^6.7.18",
     "express": "^4.21.2",
     "gifted-btns": "^1.0.2",
