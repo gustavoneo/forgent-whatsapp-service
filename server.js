@@ -1,14 +1,9 @@
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason
-} = require("@whiskeysockets/baileys");
 const express = require("express");
 const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason
-} = require("baileys");
+} = require("@whiskeysockets/baileys");
 const { sendButtons } = require("gifted-btns");
 const pino = require("pino");
 const QRCode = require("qrcode");
