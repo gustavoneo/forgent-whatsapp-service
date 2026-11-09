@@ -18,10 +18,12 @@ app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || "forgent-secret-key";
 const AUTH_DIR = path.resolve(process.env.AUTH_DIR || "./auth_info");
+const CONFIG_FILE = path.join(AUTH_DIR, "..", "forgent-config.json");
 
-if (!fs.existsSync(AUTH_DIR)) {
-  fs.mkdirSync(AUTH_DIR, { recursive: true });
-}
+if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+
+let config = { rejectCalls: false, rejectMessage: "" };
+try { config = { ...config, ...JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8")) }; } catch {}
 
 let sock = null;
 let qrCodeData = null;
@@ -30,241 +32,140 @@ let isConnected = false;
 async function startSock() {
   try {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-    const { version, isLatest } = await fetchLatestBaileysVersion();
-    console.log(`Usando Baileys v${version.join(".")}, mais recente: ${isLatest}`);
-
+    const { version } = await fetchLatestBaileysVersion();
     sock = makeWASocket({
       version,
       logger: pino({ level: "warn" }),
       auth: state,
-      printQRInTerminal: true,
+      printQRInTerminal: false,
       browser: ["Forgent WhatsApp", "Chrome", "1.0.0"],
     });
 
     sock.ev.on("creds.update", saveCreds);
 
-    sock.ev.on("connection.update", async (update) => {
-      const { connection, lastDisconnect, qr } = update;
-
+    sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
       if (qr) {
-        try {
-          qrCodeData = await QRCode.toDataURL(qr);
-          console.log("Novo QR Code gerado!");
-        } catch (err) {
-          console.error("Erro ao gerar QR Code:", err);
-        }
+        try { qrCodeData = await QRCode.toDataURL(qr); } catch (e) { console.error("Erro QR:", e); }
       }
-
       if (connection === "close") {
         isConnected = false;
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.log(`Conexão fechada. Motivo: ${statusCode}. Reconectar? ${shouldReconnect}`);
-
-        if (shouldReconnect) {
-          setTimeout(startSock, 3000);
-        } else {
-          console.log("Desconectado permanentemente (logout). Limpando sessão...");
-          try {
-            fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-          } catch {}
-          setTimeout(startSock, 3000);
+        const code = lastDisconnect?.error?.output?.statusCode;
+        if (code === DisconnectReason.loggedOut) {
+          try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); fs.mkdirSync(AUTH_DIR, { recursive: true }); } catch {}
         }
+        setTimeout(startSock, 3000);
       } else if (connection === "open") {
         isConnected = true;
         qrCodeData = null;
-        console.log(" WhatsApp conectado com sucesso!");
+        console.log("WhatsApp conectado!");
+      }
+    });
+
+    // Recusa ligações automaticamente quando ativado na Central
+    sock.ev.on("call", async (calls) => {
+      if (!config.rejectCalls) return;
+      for (const call of calls) {
+        if (call.status !== "offer") continue;
+        try {
+          await sock.rejectCall(call.id, call.from);
+          if (config.rejectMessage) await sock.sendMessage(call.from, { text: config.rejectMessage });
+        } catch (e) { console.error("Erro ao recusar ligação:", e); }
       }
     });
   } catch (error) {
-    console.error("Erro ao iniciar socket WhatsApp:", error);
+    console.error("Erro ao iniciar WhatsApp:", error);
     setTimeout(startSock, 5000);
   }
 }
 
 startSock();
 
-// Validação de API Key
 function requireApiKey(req, res, next) {
   const key = req.headers["x-api-key"] || req.query.api_key;
-  if (!key || key !== API_KEY) {
-    return res.status(401).json({ error: "Não autorizado: API Key inválida" });
-  }
+  if (!key || key !== API_KEY) return res.status(401).json({ error: "Não autorizado" });
   next();
 }
 
-// Rota de status JSON
-app.get("/status", (req, res) => {
+app.get("/status", (req, res) => res.json({ connected: isConnected, hasQr: !!qrCodeData }));
+
+// Usado pela Central: status, QR Code e número conectado
+app.get("/info", requireApiKey, (req, res) => {
+  const id = sock?.user?.id || "";
   res.json({
     connected: isConnected,
-    hasQr: !!qrCodeData,
+    qr: isConnected ? null : qrCodeData,
+    number: isConnected ? id.split(":")[0].split("@")[0] : null,
+    name: isConnected ? sock?.user?.name || null : null,
+    rejectCalls: config.rejectCalls,
   });
 });
 
-// Página HTML com QR Code ou Status
-app.get("/qr", (req, res) => {
-  if (isConnected) {
-    return res.send(`
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <meta charset="utf-8">
-          <title>WhatsApp Conectado - Forgent</title>
-          <meta name="viewport" content="width=device-width, initial-scale=1">
-          <style>
-            body { font-family: system-ui, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #0f172a; color: #f8fafc; }
-            .card { background: #1e293b; padding: 2rem; border-radius: 1rem; text-align: center; max-width: 400px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
-            .badge { display: inline-block; background: #10b981; color: #fff; padding: 0.5rem 1rem; border-radius: 9999px; font-weight: bold; margin-bottom: 1rem; }
-            h1 { margin: 0 0 0.5rem; font-size: 1.5rem; }
-            p { color: #94a3b8; font-size: 0.95rem; }
-          </style>
-        </head>
-        <body>
-          <div class="card">
-            <div class="badge">ONLINE</div>
-            <h1>WhatsApp Conectado!</h1>
-            <p>Seu serviço de envio de mensagens com botões interativos está funcionando.</p>
-          </div>
-        </body>
-      </html>
-    `);
-  }
-
-  if (qrCodeData) {
-    return res.send(`
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <meta charset="utf-8">
-          <title>Escanear QR Code - Forgent</title>
-          <meta name="viewport" content="width=device-width, initial-scale=1">
-          <meta http-equiv="refresh" content="15">
-          <style>
-            body { font-family: system-ui, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #0f172a; color: #f8fafc; }
-            .card { background: #1e293b; padding: 2rem; border-radius: 1rem; text-align: center; max-width: 420px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
-            img { width: 280px; height: 280px; border-radius: 0.5rem; background: #fff; padding: 0.5rem; }
-            h1 { margin: 0 0 0.5rem; font-size: 1.35rem; }
-            p { color: #94a3b8; font-size: 0.9rem; margin: 0.5rem 0 1.5rem; }
-            .note { font-size: 0.8rem; color: #64748b; margin-top: 1rem; }
-          </style>
-        </head>
-        <body>
-          <div class="card">
-            <h1>Conectar WhatsApp</h1>
-            <p>Abra o WhatsApp &gt; Aparelhos conectados &gt; Conectar aparelho e aponte a câmera para o QR Code abaixo:</p>
-            <img src="${qrCodeData}" alt="QR Code WhatsApp" />
-            <div class="note">A página atualiza automaticamente a cada 15 segundos.</div>
-          </div>
-        </body>
-      </html>
-    `);
-  }
-
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-      <head>
-        <meta charset="utf-8">
-        <title>Aguardando QR Code...</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <meta http-equiv="refresh" content="3">
-        <style>
-          body { font-family: system-ui, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #0f172a; color: #f8fafc; }
-          .card { background: #1e293b; padding: 2rem; border-radius: 1rem; text-align: center; }
-        </style>
-      </head>
-      <body>
-        <div class="card">
-          <p>Iniciando WhatsApp e gerando QR Code... aguarde alguns segundos.</p>
-        </div>
-      </body>
-    </html>
-  `);
+app.post("/logout", requireApiKey, async (req, res) => {
+  try { await sock?.logout(); } catch {}
+  isConnected = false;
+  res.json({ ok: true });
 });
 
-// Endpoint de envio de mensagem
+app.post("/restart", requireApiKey, async (req, res) => {
+  try { sock?.end(new Error("restart")); } catch {}
+  res.json({ ok: true });
+});
+
+app.post("/config", requireApiKey, (req, res) => {
+  config = { rejectCalls: !!req.body.rejectCalls, rejectMessage: String(req.body.rejectMessage || "").slice(0, 1000) };
+  try { fs.writeFileSync(CONFIG_FILE, JSON.stringify(config)); } catch (e) { console.error(e); }
+  res.json({ ok: true });
+});
+
+app.get("/qr", (req, res) => {
+  const page = (body, refresh) => `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">${refresh ? `<meta http-equiv="refresh" content="${refresh}">` : ""}<title>WhatsApp - Forgent</title><style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#0f172a;color:#f8fafc}.card{background:#1e293b;padding:2rem;border-radius:1rem;text-align:center;max-width:420px}img{width:280px;height:280px;border-radius:.5rem;background:#fff;padding:.5rem}p{color:#94a3b8}</style></head><body><div class="card">${body}</div></body></html>`;
+  if (isConnected) return res.send(page(`<h1>WhatsApp Conectado!</h1><p>Serviço funcionando.</p>`));
+  if (qrCodeData) return res.send(page(`<h1>Conectar WhatsApp</h1><p>WhatsApp &gt; Aparelhos conectados &gt; Conectar aparelho</p><img src="${qrCodeData}" alt="QR Code WhatsApp" />`, 15));
+  res.send(page(`<p>Gerando QR Code… aguarde.</p>`, 3));
+});
+
 app.post("/send", requireApiKey, async (req, res) => {
   try {
-    if (!isConnected || !sock) {
-      return res.status(503).json({ error: "WhatsApp desconectado. Escaneie o QR Code em /qr" });
-    }
-
+    if (!isConnected || !sock) return res.status(503).json({ error: "WhatsApp desconectado" });
     const { number, text, imageUrl, imageBase64, buttonText, buttonUrl, footer } = req.body;
+    if (!number || !text) return res.status(400).json({ error: "Campos 'number' e 'text' são obrigatórios" });
+    const jid = `${String(number).replace(/\D/g, "")}@s.whatsapp.net`;
+    const payload = { text: String(text), footer: footer ? String(footer) : undefined };
 
-    if (!number || !text) {
-      return res.status(400).json({ error: "Campos 'number' e 'text' são obrigatórios" });
-    }
-
-    const cleanNum = String(number).replace(/\D/g, "");
-    const jid = `${cleanNum}@s.whatsapp.net`;
-
-    const payload = {
-      text: String(text),
-      footer: footer ? String(footer) : undefined,
-    };
-
-    // Processamento da imagem (Base64 direto ou URL convertida em Buffer)
     if (imageBase64) {
-      try {
-        const matches = imageBase64.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
-        const raw = matches ? matches[2] : imageBase64;
-        payload.image = { buffer: Buffer.from(raw, "base64") };
-      } catch (err) {
-        console.error("Falha ao processar imageBase64:", err);
-      }
+      const m = String(imageBase64).match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+      payload.image = { buffer: Buffer.from(m ? m[2] : imageBase64, "base64") };
     } else if (imageUrl) {
       try {
-        const imgRes = await fetch(imageUrl);
-        if (imgRes.ok) {
-          const arrBuf = await imgRes.arrayBuffer();
-          payload.image = { buffer: Buffer.from(arrBuf) };
-        } else {
-          payload.image = { url: imageUrl };
-        }
-      } catch (err) {
-        console.warn("Falha ao baixar imagem por URL, tentando direta:", err);
-        payload.image = { url: imageUrl };
-      }
+        const r = await fetch(imageUrl);
+        payload.image = r.ok ? { buffer: Buffer.from(await r.arrayBuffer()) } : { url: imageUrl };
+      } catch { payload.image = { url: imageUrl }; }
     }
 
-    // Botão interativo de ação (CTA URL)
     if (buttonText && buttonUrl) {
-      payload.buttons = [
-        {
-          name: "cta_url",
-          buttonParamsJson: JSON.stringify({
-            display_text: String(buttonText),
-            url: String(buttonUrl),
-            merchant_url: String(buttonUrl),
-          }),
-        },
-      ];
+      payload.buttons = [{
+        name: "cta_url",
+        buttonParamsJson: JSON.stringify({ display_text: String(buttonText), url: String(buttonUrl), merchant_url: String(buttonUrl) }),
+      }];
     }
 
-    console.log(`Enviando para ${jid} (comImagem: ${!!payload.image}, comBotao: ${!!payload.buttons})`);
-
-    const result = await sendButtons(sock, jid, payload);
-
-    return res.json({
-      success: true,
-      messageId: result?.key?.id,
-    });
+    let result;
+    if (payload.buttons) {
+      result = await sendButtons(sock, jid, payload);
+    } else if (payload.image) {
+      // Mensagem simples sem botão: foto + legenda
+      result = await sock.sendMessage(jid, { image: payload.image.buffer ?? payload.image, caption: payload.text });
+    } else {
+      // Mensagem simples sem botão: só texto
+      result = await sock.sendMessage(jid, { text: payload.text });
+    }
+    res.json({ success: true, messageId: result?.key?.id });
   } catch (error) {
     console.error("Erro no envio:", error);
-    return res.status(500).json({
-      error: error?.message || "Erro interno ao enviar mensagem",
-    });
+    res.status(500).json({ error: error?.message || "Erro interno" });
   }
 });
 
-app.get("/", (req, res) => {
-  res.json({
-    name: "Forgent WhatsApp Button Service",
-    status: isConnected ? "connected" : "waiting_qr",
-    qrUrl: "/qr",
-  });
-});
+app.get("/", (req, res) => res.json({ name: "Forgent WhatsApp Button Service", status: isConnected ? "connected" : "waiting_qr" }));
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
-});
+app.listen(PORT, "0.0.0.0", () => console.log(`Servidor rodando na porta ${PORT}`));
