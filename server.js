@@ -40,26 +40,49 @@ async function startWhatsApp() {
 
     sock.ev.on("creds.update", saveCreds);
 
+    // ==========================================
+    // RECONHECIMENTO DE CÓDIGO DE ENTRADA (INBOUND)
+    // ==========================================
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
-  if (type !== "notify") return;
-  for (const m of messages) {
-    if (m.key.fromMe) continue;
-    const text = m.message?.conversation || m.message?.extendedTextMessage?.text || "";
-    if (!/[A-Za-z]{3}\d{5}/.test(text)) continue;
-    const jid = m.key.remoteJid || "";
-    const from = jid.endsWith("@lid") ? (m.key.remoteJidAlt || m.key.senderPn || "") : jid;
-    try {
-      const r = await fetch("https://painel.forgent.pro/api/public/v1/phone/inbound", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": process.env.API_KEY },
-        body: JSON.stringify({ from, text }),
-      });
-      const j = await r.json();
-      if (j.matched && j.reply) await sock.sendMessage(jid, { text: j.reply });
-    } catch (e) { console.error("inbound", e.message); }
-  }
-});
+      if (type !== "notify") return;
+      for (const m of messages) {
+        if (m.key.fromMe) continue;
 
+        const text =
+          m.message?.conversation ||
+          m.message?.extendedTextMessage?.text ||
+          m.message?.imageMessage?.caption ||
+          "";
+
+        // Filtra siglas de 3 letras + 5 números (ex: UPL-48291, upl 48291, UPL48291)
+        if (!/[A-Za-z]{3}\s*-?\s*\d{5}/i.test(text)) continue;
+
+        const jid = m.key.remoteJid || "";
+        if (!jid || jid === "status@broadcast") continue;
+
+        const from = jid.endsWith("@lid")
+          ? (m.key.remoteJidAlt || m.key.senderPn || jid)
+          : jid;
+
+        try {
+          const r = await fetch("https://painel.forgent.pro/api/public/v1/phone/inbound", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-api-key": process.env.API_KEY || API_KEY,
+            },
+            body: JSON.stringify({ from, text }),
+          });
+
+          const j = await r.json();
+          if (j.matched && j.reply) {
+            await sock.sendMessage(jid, { text: j.reply });
+          }
+        } catch (e) {
+          console.error("Erro no inbound:", e.message);
+        }
+      }
+    });
 
     sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;
@@ -263,7 +286,7 @@ app.post("/send", async (req, res) => {
         caption: String(text),
       });
     } 
-    // 3. TEXTO PURO (CÓDIGO DE CONFIRMAÇÃO / TESTE): Baileys 100% nativo!
+    // 3. TEXTO PURO: Baileys 100% nativo
     else {
       result = await sock.sendMessage(jid, {
         text: String(text),
