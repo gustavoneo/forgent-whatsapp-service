@@ -40,6 +40,27 @@ async function startWhatsApp() {
 
     sock.ev.on("creds.update", saveCreds);
 
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+  if (type !== "notify") return;
+  for (const m of messages) {
+    if (m.key.fromMe) continue;
+    const text = m.message?.conversation || m.message?.extendedTextMessage?.text || "";
+    if (!/[A-Za-z]{3}\d{5}/.test(text)) continue;
+    const jid = m.key.remoteJid || "";
+    const from = jid.endsWith("@lid") ? (m.key.remoteJidAlt || m.key.senderPn || "") : jid;
+    try {
+      const r = await fetch("https://painel.forgent.pro/api/public/v1/phone/inbound", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": process.env.API_KEY },
+        body: JSON.stringify({ from, text }),
+      });
+      const j = await r.json();
+      if (j.matched && j.reply) await sock.sendMessage(jid, { text: j.reply });
+    } catch (e) { console.error("inbound", e.message); }
+  }
+});
+
+
     sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
