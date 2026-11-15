@@ -35,7 +35,6 @@ async function startWhatsApp() {
   if (isReconnecting) return;
   isReconnecting = true;
 
-  // Encerra socket anterior para evitar duplicidade de robôs
   if (sock) {
     try {
       sock.ev.removeAllListeners();
@@ -47,13 +46,12 @@ async function startWhatsApp() {
   try {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
-    // Busca a versão Web mais recente e oficial aceita pela Meta
     let waVersion = [2, 3000, 1015901307];
     try {
       const { version, isLatest } = await fetchLatestBaileysVersion();
       if (version) {
         waVersion = version;
-        console.log(`[WhatsApp] Usando versão Web oficial: ${version.join(".")}, é a mais recente: ${isLatest}`);
+        console.log(`[WhatsApp] Versão Web oficial: ${version.join(".")}, mais recente: ${isLatest}`);
       }
     } catch (verErr) {
       console.warn("[WhatsApp] Fallback versão Web:", verErr.message);
@@ -87,7 +85,7 @@ async function startWhatsApp() {
           m.message?.imageMessage?.caption ||
           "";
 
-        // Filtra siglas de 3 letras + 5 números (ex: UPL-48291, upl 48291, UPL48291)
+        // Filtra códigos com 3 letras + 5 números (ex: UPL-48291, upl 48291, UPL48291)
         if (!/[A-Za-z]{3}\s*-?\s*\d{5}/i.test(text)) continue;
 
         const jid = m.key.remoteJid || "";
@@ -119,13 +117,9 @@ async function startWhatsApp() {
 
           const j = await r.json();
           if (j.matched && j.reply) {
-            // Se for conta Business (@lid), responde usando o JID numérico e citando a mensagem
-            const replyJid = jid.endsWith("@lid") && from
-              ? (from.includes("@") ? from : `${from.replace(/\D/g, "")}@s.whatsapp.net`)
-              : jid;
-
-            await sock.sendMessage(replyJid, { text: j.reply }, { quoted: m });
-            console.log(`[WhatsApp Inbound] Resposta enviada com sucesso para ${replyJid}`);
+            // Responde diretamente no chat que enviou o código
+            await sock.sendMessage(jid, { text: j.reply });
+            console.log(`[WhatsApp Inbound] Resposta enviada para ${jid}`);
           }
         } catch (e) {
           console.error("Erro no inbound:", e.message);
@@ -142,73 +136,66 @@ async function startWhatsApp() {
       if (qr) {
         try {
           qrCodeData = await QRCode.toDataURL(qr);
-        } catch (err) {
-          console.error("Erro ao gerar QR Code:", err);
+        } catch (e) {
+          qrCodeData = null;
         }
       }
 
       if (connection === "close") {
         isConnected = false;
-        isReconnecting = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-
-        console.log(`[WhatsApp] Conexão fechada. Motivo: ${statusCode}. Reconectar: ${shouldReconnect}`);
-
-        if (statusCode === DisconnectReason.loggedOut) {
+        console.log(`Conexão fechada (${statusCode}). Reconectar? ${shouldReconnect}`);
+        isReconnecting = false;
+        if (shouldReconnect) {
+          setTimeout(startWhatsApp, 3000);
+        } else {
           try {
             fs.rmSync(AUTH_DIR, { recursive: true, force: true });
           } catch (e) {}
-        }
-
-        if (shouldReconnect) {
+          qrCodeData = null;
           setTimeout(startWhatsApp, 3000);
         }
       } else if (connection === "open") {
         isConnected = true;
         isReconnecting = false;
         qrCodeData = null;
-        console.log(`[WhatsApp] Conectado com sucesso como: ${sock?.user?.id || "Desconhecido"}`);
+        console.log("WhatsApp Conectado com Sucesso!");
       }
     });
 
     // ==========================================
-    // REJEIÇÃO AUTOMÁTICA DE LIGAÇÕES
+    // REJEIÇÃO DE CHAMADAS
     // ==========================================
     sock.ev.on("call", async (calls) => {
       if (!rejectCalls) return;
-      for (const call of calls) {
-        if (call.status === "offer") {
+      for (const c of calls) {
+        if (c.status === "offer") {
           try {
-            await sock.rejectCall(call.id, call.from);
+            await sock.rejectCall(c.id, c.from);
             if (rejectMessage) {
-              await sock.sendMessage(call.from, { text: rejectMessage });
+              await sock.sendMessage(c.from, { text: rejectMessage });
             }
           } catch (e) {
-            console.error("Erro ao rejeitar chamada:", e.message);
+            console.error("Erro ao rejeitar chamada:", e);
           }
         }
       }
     });
-  } catch (error) {
-    console.error("[WhatsApp] Erro fatal ao iniciar socket:", error);
+  } catch (err) {
+    console.error("Erro ao iniciar WhatsApp:", err);
     isReconnecting = false;
     setTimeout(startWhatsApp, 5000);
   }
 }
 
-// Inicia o serviço
 startWhatsApp();
 
 // ==========================================
-// ROTAS DA API
+// ROTAS HTTP
 // ==========================================
-
 app.get("/status", (req, res) => {
-  res.json({
-    connected: isConnected,
-    hasQr: !!qrCodeData,
-  });
+  res.json({ connected: isConnected, hasQr: !!qrCodeData });
 });
 
 app.get("/info", (req, res) => {
@@ -286,6 +273,9 @@ app.post("/config", (req, res) => {
   res.json({ ok: true });
 });
 
+// ==========================================
+// DISPARO DE MENSAGENS (/send)
+// ==========================================
 app.post("/send", async (req, res) => {
   const apiKey = req.headers["x-api-key"];
   if (apiKey !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
@@ -301,17 +291,7 @@ app.post("/send", async (req, res) => {
 
   try {
     const cleanNum = String(number).replace(/\D/g, "");
-
-    // Consulta a Meta para pegar o JID canônico e ativo do contato
-    let targetJid = `${cleanNum}@s.whatsapp.net`;
-    try {
-      const [lookup] = await sock.onWhatsApp(cleanNum);
-      if (lookup && lookup.exists && lookup.jid) {
-        targetJid = lookup.jid;
-      }
-    } catch (e) {
-      console.warn("[WhatsApp] onWhatsApp falhou para:", cleanNum, e.message);
-    }
+    const jid = `${cleanNum}@s.whatsapp.net`;
 
     let imageBuffer = null;
     if (imageBase64) {
@@ -353,23 +333,23 @@ app.post("/send", async (req, res) => {
         ],
       };
       if (imageBuffer) payload.image = { buffer: imageBuffer };
-      result = await sendButtons(sock, targetJid, payload);
+      result = await sendButtons(sock, jid, payload);
     } 
-    // 2. Mensagem com Imagem sem Botão: usa imagem nativa do Baileys
+    // 2. Mensagem com Imagem sem Botão: usa imagem nativa
     else if (imageBuffer) {
-      result = await sock.sendMessage(targetJid, {
+      result = await sock.sendMessage(jid, {
         image: imageBuffer,
         caption: String(text),
       });
     } 
-    // 3. TEXTO PURO: Baileys 100% nativo
+    // 3. Texto Puro: nativo Baileys
     else {
-      result = await sock.sendMessage(targetJid, {
+      result = await sock.sendMessage(jid, {
         text: String(text),
       });
     }
 
-    console.log(`[WhatsApp] Enviado para ${targetJid}, ID: ${result?.key?.id}`);
+    console.log(`[WhatsApp] Enviado para ${jid}, ID: ${result?.key?.id}`);
 
     return res.json({
       success: true,
