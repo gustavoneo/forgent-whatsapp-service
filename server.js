@@ -46,7 +46,7 @@ async function startWhatsApp() {
 
   try {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-    
+
     // Busca a versão Web mais recente e oficial aceita pela Meta
     let waVersion = [2, 3000, 1015901307];
     try {
@@ -56,7 +56,7 @@ async function startWhatsApp() {
         console.log(`[WhatsApp] Usando versão Web oficial: ${version.join(".")}, é a mais recente: ${isLatest}`);
       }
     } catch (verErr) {
-      console.warn("[WhatsApp] Não foi possível buscar versão remota, usando fallback:", verErr.message);
+      console.warn("[WhatsApp] Fallback versão Web:", verErr.message);
     }
 
     sock = makeWASocket({
@@ -119,7 +119,13 @@ async function startWhatsApp() {
 
           const j = await r.json();
           if (j.matched && j.reply) {
-            await sock.sendMessage(jid, { text: j.reply });
+            // Se for conta Business (@lid), responde usando o JID numérico e citando a mensagem
+            const replyJid = jid.endsWith("@lid") && from
+              ? (from.includes("@") ? from : `${from.replace(/\D/g, "")}@s.whatsapp.net`)
+              : jid;
+
+            await sock.sendMessage(replyJid, { text: j.reply }, { quoted: m });
+            console.log(`[WhatsApp Inbound] Resposta enviada com sucesso para ${replyJid}`);
           }
         } catch (e) {
           console.error("Erro no inbound:", e.message);
@@ -295,7 +301,7 @@ app.post("/send", async (req, res) => {
 
   try {
     const cleanNum = String(number).replace(/\D/g, "");
-    
+
     // Consulta a Meta para pegar o JID canônico e ativo do contato
     let targetJid = `${cleanNum}@s.whatsapp.net`;
     try {
@@ -363,7 +369,7 @@ app.post("/send", async (req, res) => {
       });
     }
 
-    console.log(`[WhatsApp] Mensagem enviada para ${targetJid}, ID: ${result?.key?.id}`);
+    console.log(`[WhatsApp] Enviado para ${targetJid}, ID: ${result?.key?.id}`);
 
     return res.json({
       success: true,
