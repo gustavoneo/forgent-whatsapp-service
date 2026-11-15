@@ -8,6 +8,7 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   Browsers,
+  fetchLatestBaileysVersion,
 } = require("@whiskeysockets/baileys");
 const { sendButtons } = require("gifted-btns");
 
@@ -34,7 +35,7 @@ async function startWhatsApp() {
   if (isReconnecting) return;
   isReconnecting = true;
 
-  // Limpa socket anterior para evitar duplicidade de conexões
+  // Encerra socket anterior para evitar duplicidade de robôs
   if (sock) {
     try {
       sock.ev.removeAllListeners();
@@ -45,12 +46,25 @@ async function startWhatsApp() {
 
   try {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    
+    // Busca a versão Web mais recente e oficial aceita pela Meta
+    let waVersion = [2, 3000, 1015901307];
+    try {
+      const { version, isLatest } = await fetchLatestBaileysVersion();
+      if (version) {
+        waVersion = version;
+        console.log(`[WhatsApp] Usando versão Web oficial: ${version.join(".")}, é a mais recente: ${isLatest}`);
+      }
+    } catch (verErr) {
+      console.warn("[WhatsApp] Não foi possível buscar versão remota, usando fallback:", verErr.message);
+    }
 
     sock = makeWASocket({
+      version: waVersion,
       auth: state,
       logger: pino({ level: "warn" }),
       printQRInTerminal: false,
-      browser: Browsers.ubuntu("Chrome"),
+      browser: Browsers.macOS("Desktop"),
       keepAliveIntervalMs: 30000,
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 60000,
@@ -122,8 +136,8 @@ async function startWhatsApp() {
       if (qr) {
         try {
           qrCodeData = await QRCode.toDataURL(qr);
-        } catch (e) {
-          qrCodeData = null;
+        } catch (err) {
+          console.error("Erro ao gerar QR Code:", err);
         }
       }
 
@@ -132,58 +146,63 @@ async function startWhatsApp() {
         isReconnecting = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.log(`Conexão fechada (${statusCode}). Reconectar?`, shouldReconnect);
 
-        if (shouldReconnect) {
-          setTimeout(startWhatsApp, 4000);
-        } else {
-          console.log("Sessão deslogada. Limpando credenciais antigas...");
+        console.log(`[WhatsApp] Conexão fechada. Motivo: ${statusCode}. Reconectar: ${shouldReconnect}`);
+
+        if (statusCode === DisconnectReason.loggedOut) {
           try {
             fs.rmSync(AUTH_DIR, { recursive: true, force: true });
           } catch (e) {}
-          qrCodeData = null;
-          setTimeout(startWhatsApp, 4000);
+        }
+
+        if (shouldReconnect) {
+          setTimeout(startWhatsApp, 3000);
         }
       } else if (connection === "open") {
         isConnected = true;
         isReconnecting = false;
         qrCodeData = null;
-        console.log("WhatsApp Conectado com Sucesso!");
+        console.log(`[WhatsApp] Conectado com sucesso como: ${sock?.user?.id || "Desconhecido"}`);
       }
     });
 
     // ==========================================
-    // REJEIÇÃO DE CHAMADAS
+    // REJEIÇÃO AUTOMÁTICA DE LIGAÇÕES
     // ==========================================
     sock.ev.on("call", async (calls) => {
       if (!rejectCalls) return;
-      for (const c of calls) {
-        if (c.status === "offer") {
+      for (const call of calls) {
+        if (call.status === "offer") {
           try {
-            await sock.rejectCall(c.id, c.from);
+            await sock.rejectCall(call.id, call.from);
             if (rejectMessage) {
-              await sock.sendMessage(c.from, { text: rejectMessage });
+              await sock.sendMessage(call.from, { text: rejectMessage });
             }
           } catch (e) {
-            console.error("Erro ao rejeitar chamada:", e);
+            console.error("Erro ao rejeitar chamada:", e.message);
           }
         }
       }
     });
-  } catch (err) {
-    console.error("Erro ao iniciar WhatsApp:", err);
+  } catch (error) {
+    console.error("[WhatsApp] Erro fatal ao iniciar socket:", error);
     isReconnecting = false;
     setTimeout(startWhatsApp, 5000);
   }
 }
 
+// Inicia o serviço
 startWhatsApp();
 
 // ==========================================
 // ROTAS DA API
 // ==========================================
+
 app.get("/status", (req, res) => {
-  res.json({ connected: isConnected, hasQr: !!qrCodeData });
+  res.json({
+    connected: isConnected,
+    hasQr: !!qrCodeData,
+  });
 });
 
 app.get("/info", (req, res) => {
@@ -276,7 +295,17 @@ app.post("/send", async (req, res) => {
 
   try {
     const cleanNum = String(number).replace(/\D/g, "");
-    const jid = `${cleanNum}@s.whatsapp.net`;
+    
+    // Consulta a Meta para pegar o JID canônico e ativo do contato
+    let targetJid = `${cleanNum}@s.whatsapp.net`;
+    try {
+      const [lookup] = await sock.onWhatsApp(cleanNum);
+      if (lookup && lookup.exists && lookup.jid) {
+        targetJid = lookup.jid;
+      }
+    } catch (e) {
+      console.warn("[WhatsApp] onWhatsApp falhou para:", cleanNum, e.message);
+    }
 
     let imageBuffer = null;
     if (imageBase64) {
@@ -318,28 +347,30 @@ app.post("/send", async (req, res) => {
         ],
       };
       if (imageBuffer) payload.image = { buffer: imageBuffer };
-      result = await sendButtons(sock, jid, payload);
+      result = await sendButtons(sock, targetJid, payload);
     } 
     // 2. Mensagem com Imagem sem Botão: usa imagem nativa do Baileys
     else if (imageBuffer) {
-      result = await sock.sendMessage(jid, {
+      result = await sock.sendMessage(targetJid, {
         image: imageBuffer,
         caption: String(text),
       });
     } 
     // 3. TEXTO PURO: Baileys 100% nativo
     else {
-      result = await sock.sendMessage(jid, {
+      result = await sock.sendMessage(targetJid, {
         text: String(text),
       });
     }
+
+    console.log(`[WhatsApp] Mensagem enviada para ${targetJid}, ID: ${result?.key?.id}`);
 
     return res.json({
       success: true,
       messageId: result?.key?.id || "sent",
     });
   } catch (error) {
-    console.error("Erro no envio:", error);
+    console.error("[WhatsApp] Erro no envio:", error);
     return res.status(500).json({
       error: error?.message || "Erro interno ao enviar mensagem",
     });
