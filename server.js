@@ -7,6 +7,7 @@ const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
+  Browsers,
 } = require("@whiskeysockets/baileys");
 const { sendButtons } = require("gifted-btns");
 
@@ -24,10 +25,24 @@ if (!fs.existsSync(AUTH_DIR)) {
 let sock = null;
 let qrCodeData = null;
 let isConnected = false;
+let isReconnecting = false;
 let rejectCalls = false;
-let rejectMessage = "Olá! Este número é exclusivo para avisos e cobranças automáticas e não recebe ligações. Por favor, envie uma mensagem de texto. 🙏";
+let rejectMessage =
+  "Olá! Este número é exclusivo para avisos e cobranças automáticas e não recebe ligações. Por favor, envie uma mensagem de texto. 🙏";
 
 async function startWhatsApp() {
+  if (isReconnecting) return;
+  isReconnecting = true;
+
+  // Limpa socket anterior para evitar duplicidade de conexões
+  if (sock) {
+    try {
+      sock.ev.removeAllListeners();
+      sock.end();
+    } catch (e) {}
+    sock = null;
+  }
+
   try {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
@@ -35,7 +50,11 @@ async function startWhatsApp() {
       auth: state,
       logger: pino({ level: "warn" }),
       printQRInTerminal: false,
-      browser: ["Forgent Central", "Chrome", "1.0.0"],
+      browser: Browsers.ubuntu("Chrome"),
+      keepAliveIntervalMs: 30000,
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000,
+      syncFullHistory: false,
     });
 
     sock.ev.on("creds.update", saveCreds);
@@ -58,11 +77,21 @@ async function startWhatsApp() {
         if (!/[A-Za-z]{3}\s*-?\s*\d{5}/i.test(text)) continue;
 
         const jid = m.key.remoteJid || "";
-        if (!jid || jid === "status@broadcast") continue;
+        if (!jid || jid.includes("@broadcast")) continue;
 
-        const from = jid.endsWith("@lid")
-          ? (m.key.remoteJidAlt || m.key.senderPn || jid)
-          : jid;
+        let from = jid;
+        if (jid.endsWith("@lid")) {
+          from = m.key.remoteJidAlt || m.key.senderPn || "";
+          if (!from) {
+            try {
+              from = (await sock.signalRepository?.lidMapping?.getPNForLID?.(jid)) || "";
+            } catch (e) {}
+          }
+          if (!from) {
+            console.warn("Não foi possível resolver LID para:", jid);
+            continue;
+          }
+        }
 
         try {
           const r = await fetch("https://painel.forgent.pro/api/public/v1/phone/inbound", {
@@ -84,6 +113,9 @@ async function startWhatsApp() {
       }
     });
 
+    // ==========================================
+    // STATUS DA CONEXÃO
+    // ==========================================
     sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
@@ -97,25 +129,32 @@ async function startWhatsApp() {
 
       if (connection === "close") {
         isConnected = false;
+        isReconnecting = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.log("Conexão fechada. Reconectar?", shouldReconnect);
+        console.log(`Conexão fechada (${statusCode}). Reconectar?`, shouldReconnect);
+
         if (shouldReconnect) {
-          setTimeout(startWhatsApp, 3000);
+          setTimeout(startWhatsApp, 4000);
         } else {
+          console.log("Sessão deslogada. Limpando credenciais antigas...");
           try {
             fs.rmSync(AUTH_DIR, { recursive: true, force: true });
           } catch (e) {}
           qrCodeData = null;
-          setTimeout(startWhatsApp, 3000);
+          setTimeout(startWhatsApp, 4000);
         }
       } else if (connection === "open") {
         isConnected = true;
+        isReconnecting = false;
         qrCodeData = null;
         console.log("WhatsApp Conectado com Sucesso!");
       }
     });
 
+    // ==========================================
+    // REJEIÇÃO DE CHAMADAS
+    // ==========================================
     sock.ev.on("call", async (calls) => {
       if (!rejectCalls) return;
       for (const c of calls) {
@@ -133,12 +172,16 @@ async function startWhatsApp() {
     });
   } catch (err) {
     console.error("Erro ao iniciar WhatsApp:", err);
+    isReconnecting = false;
     setTimeout(startWhatsApp, 5000);
   }
 }
 
 startWhatsApp();
 
+// ==========================================
+// ROTAS DA API
+// ==========================================
 app.get("/status", (req, res) => {
   res.json({ connected: isConnected, hasQr: !!qrCodeData });
 });
@@ -168,7 +211,7 @@ app.get("/qr", (req, res) => {
     return res.send(`
       <html><body style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;background:#111;color:#fff;">
         <div style="text-align:center;">
-          <h2>Iniciando sessão do WhatsApp...</h2>
+          <h2>Gerando QR Code...</h2>
           <p>Aguarde alguns segundos e recarregue a página.</p>
           <script>setTimeout(() => location.reload(), 3000);</script>
         </div>
@@ -179,9 +222,9 @@ app.get("/qr", (req, res) => {
     <html><body style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;background:#111;color:#fff;">
       <div style="text-align:center;">
         <h2>Escaneie o QR Code</h2>
-        <p>Abra o WhatsApp > Aparelhos Conectados > Conectar Aparelho</p>
-        <img src="${qrCodeData}" style="border: 8px solid white; border-radius: 12px; width: 280px; height: 280px;" />
-        <script>setTimeout(() => location.reload(), 15000);</script>
+        <img src="${qrCodeData}" style="width:300px;height:300px;border-radius:8px;background:#fff;padding:10px;" />
+        <p style="color:#888;">Atualiza automaticamente</p>
+        <script>setTimeout(() => location.reload(), 20000);</script>
       </div>
     </body></html>
   `);
@@ -190,10 +233,7 @@ app.get("/qr", (req, res) => {
 app.post("/restart", (req, res) => {
   const apiKey = req.headers["x-api-key"];
   if (apiKey !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
-  try {
-    if (sock) sock.end();
-  } catch (e) {}
-  isConnected = false;
+  isReconnecting = false;
   setTimeout(startWhatsApp, 1000);
   res.json({ ok: true });
 });
@@ -201,10 +241,11 @@ app.post("/restart", (req, res) => {
 app.post("/logout", async (req, res) => {
   const apiKey = req.headers["x-api-key"];
   if (apiKey !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
+  isConnected = false;
+  isReconnecting = false;
   try {
     if (sock) await sock.logout();
   } catch (e) {}
-  isConnected = false;
   try {
     fs.rmSync(AUTH_DIR, { recursive: true, force: true });
   } catch (e) {}
